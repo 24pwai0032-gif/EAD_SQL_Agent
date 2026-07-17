@@ -1,0 +1,180 @@
+[
+  {
+    "question": "How much has ADB given us?",
+    "sql": "SELECT ROUND(SUM(amount_usd_mn), 2) AS total_usd_mn FROM v_disbursements WHERE partner_abbreviation = 'ADB' AND status = 'Cleared'",
+    "expects_chart": false,
+    "trap": "Ambiguous commitment-vs-disbursement — must state which it used ('given' = disbursements)"
+  },
+  {
+    "question": "What is the average interest rate across all assistance?",
+    "sql": "SELECT ROUND(AVG(interest_rate_pct), 2) AS avg_interest_pct FROM v_commitments WHERE assistance_type = 'Loan'",
+    "expects_chart": false,
+    "trap": "Grants/TA are NULL, not 0% — must average over loans only and say so"
+  },
+  {
+    "question": "What was our total debt service in FY2025?",
+    "sql": "SELECT ROUND(SUM(amount_usd_mn), 2) AS debt_service_usd_mn FROM v_debt_service WHERE fiscal_year = 'FY2025' AND status = 'Cleared'",
+    "expects_chart": false,
+    "trap": "Debt service = principal AND interest, not principal alone"
+  },
+  {
+    "question": "Show me disbursements by year in rupees",
+    "sql": "SELECT fiscal_year, ROUND(SUM(amount_pkr_mn), 2) AS disbursed_pkr_mn FROM v_disbursements WHERE status = 'Cleared' GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true,
+    "trap": "Must warn that PKR sums mix exchange rates across years (or offer USD)"
+  },
+  {
+    "question": "How much did we receive in 2024?",
+    "sql": "SELECT ROUND(SUM(amount_usd_mn), 2) AS disbursed_usd_mn FROM v_disbursements WHERE fiscal_year = 'FY2024' AND status = 'Cleared'",
+    "expects_chart": false,
+    "trap": "Must state fiscal year FY2024 (Jul 2023 - Jun 2024) vs calendar 2024"
+  },
+  {
+    "question": "Which province received the most disbursements?",
+    "sql": "SELECT province_name, ROUND(SUM(amount_usd_mn), 2) AS total_usd_mn FROM v_disbursements WHERE status = 'Cleared' AND province_name IS NOT NULL GROUP BY province_name ORDER BY total_usd_mn DESC",
+    "expects_chart": true,
+    "trap": "Federal rows are NULL province — must not silently fold them into a province or drop without saying so"
+  },
+  {
+    "question": "How many development partners are there?",
+    "sql": "SELECT COUNT(DISTINCT partner_abbreviation) AS n_partners FROM v_fea_transactions",
+    "expects_chart": false,
+    "trap": "Single value — must NOT chart"
+  },
+  {
+    "question": "List all agreement refs for IDA",
+    "sql": "SELECT DISTINCT agreement_ref FROM v_fea_transactions WHERE partner_abbreviation = 'IDA' ORDER BY agreement_ref LIMIT 50",
+    "expects_chart": false,
+    "trap": "Bare list of refs — must NOT chart"
+  },
+  {
+    "question": "Total cleared commitments by partner type in FY2024",
+    "sql": "SELECT partner_type, ROUND(SUM(amount_usd_mn), 2) AS committed_usd_mn FROM v_commitments WHERE fiscal_year = 'FY2024' AND status = 'Cleared' GROUP BY partner_type ORDER BY committed_usd_mn DESC",
+    "expects_chart": true
+  },
+  {
+    "question": "Who are our top 5 partners by total cleared disbursements?",
+    "sql": "SELECT partner_abbreviation, ROUND(SUM(amount_usd_mn), 2) AS disbursed_usd_mn FROM v_disbursements WHERE status = 'Cleared' GROUP BY partner_abbreviation ORDER BY disbursed_usd_mn DESC LIMIT 5",
+    "expects_chart": true
+  },
+  {
+    "question": "Show the trend of cleared disbursements over fiscal years in USD",
+    "sql": "SELECT fiscal_year, ROUND(SUM(amount_usd_mn), 2) AS disbursed_usd_mn FROM v_disbursements WHERE status = 'Cleared' GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true
+  },
+  {
+    "question": "Break down cleared commitments in FY2025 by sector",
+    "sql": "SELECT sector_name, ROUND(SUM(amount_usd_mn), 2) AS committed_usd_mn FROM v_commitments WHERE fiscal_year = 'FY2025' AND status = 'Cleared' GROUP BY sector_name ORDER BY committed_usd_mn DESC",
+    "expects_chart": true
+  },
+  {
+    "question": "What share of cleared commitment value is loans vs grants vs technical assistance?",
+    "sql": "SELECT assistance_type, ROUND(SUM(amount_usd_mn), 2) AS committed_usd_mn FROM v_commitments WHERE status = 'Cleared' GROUP BY assistance_type ORDER BY committed_usd_mn DESC",
+    "expects_chart": true
+  },
+  {
+    "question": "What is the undisbursed balance for IDA?",
+    "sql": "SELECT ROUND((SELECT SUM(amount_usd_mn) FROM v_commitments WHERE partner_abbreviation = 'IDA' AND status = 'Cleared') - (SELECT SUM(amount_usd_mn) FROM v_disbursements WHERE partner_abbreviation = 'IDA' AND status = 'Cleared'), 2) AS undisbursed_usd_mn",
+    "expects_chart": false
+  },
+  {
+    "question": "Show total cleared debt service by fiscal year",
+    "sql": "SELECT fiscal_year, ROUND(SUM(amount_usd_mn), 2) AS debt_service_usd_mn FROM v_debt_service WHERE status = 'Cleared' GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true
+  },
+  {
+    "question": "Compare principal repayments and interest payments by fiscal year",
+    "sql": "SELECT fiscal_year, ROUND(SUM(CASE WHEN flow_type = 'Principal Repayment' THEN amount_usd_mn ELSE 0 END), 2) AS principal_usd_mn, ROUND(SUM(CASE WHEN flow_type = 'Interest Payment' THEN amount_usd_mn ELSE 0 END), 2) AS interest_usd_mn FROM v_debt_service WHERE status = 'Cleared' GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true
+  },
+  {
+    "question": "Which wing handles JICA?",
+    "sql": "SELECT DISTINCT wing_name FROM v_fea_transactions WHERE partner_abbreviation = 'JICA'",
+    "expects_chart": false
+  },
+  {
+    "question": "List our Paris Club creditors",
+    "sql": "SELECT DISTINCT partner_abbreviation FROM v_fea_transactions WHERE is_paris_club = 1 ORDER BY partner_abbreviation",
+    "expects_chart": false
+  },
+  {
+    "question": "How much grant money has USAID actually disbursed to us in total?",
+    "sql": "SELECT ROUND(SUM(amount_usd_mn), 2) AS disbursed_usd_mn FROM v_disbursements WHERE partner_abbreviation = 'USAID' AND assistance_type = 'Grant' AND status = 'Cleared'",
+    "expects_chart": false
+  },
+  {
+    "question": "What is the average cleared loan commitment size for each of the top 10 partners by that average?",
+    "sql": "SELECT partner_abbreviation, ROUND(AVG(amount_usd_mn), 2) AS avg_commitment_usd_mn FROM v_commitments WHERE assistance_type = 'Loan' AND status = 'Cleared' GROUP BY partner_abbreviation ORDER BY avg_commitment_usd_mn DESC LIMIT 10",
+    "expects_chart": true
+  },
+  {
+    "question": "How many transactions are currently pending?",
+    "sql": "SELECT COUNT(*) AS n_pending FROM v_fea_transactions WHERE status = 'Pending'",
+    "expects_chart": false
+  },
+  {
+    "question": "Total transaction value by status in USD",
+    "sql": "SELECT status, ROUND(SUM(amount_usd_mn), 2) AS total_usd_mn FROM v_fea_transactions GROUP BY status ORDER BY total_usd_mn DESC",
+    "expects_chart": true
+  },
+  {
+    "question": "Break down cleared disbursements to Punjab by sector",
+    "sql": "SELECT sector_name, ROUND(SUM(amount_usd_mn), 2) AS disbursed_usd_mn FROM v_disbursements WHERE province_name = 'Punjab' AND status = 'Cleared' GROUP BY sector_name ORDER BY disbursed_usd_mn DESC",
+    "expects_chart": true
+  },
+  {
+    "question": "How much interest did we pay in FY2024?",
+    "sql": "SELECT ROUND(SUM(amount_usd_mn), 2) AS interest_usd_mn FROM v_debt_service WHERE flow_type = 'Interest Payment' AND fiscal_year = 'FY2024' AND status = 'Cleared'",
+    "expects_chart": false
+  },
+  {
+    "question": "Compare concessional and non-concessional cleared loan commitments by fiscal year",
+    "sql": "SELECT fiscal_year, ROUND(SUM(CASE WHEN is_concessional = 1 THEN amount_usd_mn ELSE 0 END), 2) AS concessional_usd_mn, ROUND(SUM(CASE WHEN is_concessional = 0 THEN amount_usd_mn ELSE 0 END), 2) AS non_concessional_usd_mn FROM v_commitments WHERE assistance_type = 'Loan' AND status = 'Cleared' GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true
+  },
+  {
+    "question": "Which sectors have received the most cleared commitment value overall?",
+    "sql": "SELECT sector_name, ROUND(SUM(amount_usd_mn), 2) AS committed_usd_mn FROM v_commitments WHERE status = 'Cleared' GROUP BY sector_name ORDER BY committed_usd_mn DESC",
+    "expects_chart": true
+  },
+  {
+    "question": "How many disbursement requests were rejected in FY2023?",
+    "sql": "SELECT COUNT(*) AS n_rejected FROM v_disbursements WHERE status = 'Rejected' AND fiscal_year = 'FY2023'",
+    "expects_chart": false
+  },
+  {
+    "question": "Show the average PKR exchange rate by fiscal year",
+    "sql": "SELECT fiscal_year, ROUND(AVG(exchange_rate_pkr), 2) AS avg_pkr_per_usd FROM v_fea_transactions GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true
+  },
+  {
+    "question": "How much technical assistance have UN agencies actually disbursed to us in total?",
+    "sql": "SELECT ROUND(SUM(amount_usd_mn), 2) AS ta_disbursed_usd_mn FROM v_disbursements WHERE partner_type = 'UN agency' AND assistance_type = 'Technical Assistance' AND status = 'Cleared'",
+    "expects_chart": false
+  },
+  {
+    "question": "What is the single largest cleared commitment ever signed, and with whom?",
+    "sql": "SELECT partner_abbreviation, fiscal_year, ROUND(amount_usd_mn, 2) AS amount_usd_mn FROM v_commitments WHERE status = 'Cleared' ORDER BY amount_usd_mn DESC LIMIT 1",
+    "expects_chart": false
+  },
+  {
+    "question": "Show CEXIM cleared disbursements by fiscal year",
+    "sql": "SELECT fiscal_year, ROUND(SUM(amount_usd_mn), 2) AS disbursed_usd_mn FROM v_disbursements WHERE partner_abbreviation = 'CEXIM' AND status = 'Cleared' GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true
+  },
+  {
+    "question": "How much in cleared commitments did the China Wing handle in FY2022?",
+    "sql": "SELECT ROUND(SUM(amount_usd_mn), 2) AS committed_usd_mn FROM v_commitments WHERE wing_name = 'China Wing' AND fiscal_year = 'FY2022' AND status = 'Cleared'",
+    "expects_chart": false
+  },
+  {
+    "question": "Compare cleared commitments and disbursements by fiscal year in USD",
+    "sql": "SELECT fiscal_year, ROUND(SUM(CASE WHEN flow_type = 'Commitment' THEN amount_usd_mn ELSE 0 END), 2) AS committed_usd_mn, ROUND(SUM(CASE WHEN flow_type = 'Disbursement' THEN amount_usd_mn ELSE 0 END), 2) AS disbursed_usd_mn FROM v_fea_transactions WHERE status = 'Cleared' AND flow_type IN ('Commitment','Disbursement') GROUP BY fiscal_year ORDER BY fiscal_year",
+    "expects_chart": true
+  },
+  {
+    "question": "Which five executing agencies handled the most cleared disbursement value?",
+    "sql": "SELECT agency_name, ROUND(SUM(amount_usd_mn), 2) AS disbursed_usd_mn FROM v_disbursements WHERE status = 'Cleared' GROUP BY agency_name ORDER BY disbursed_usd_mn DESC LIMIT 5",
+    "expects_chart": true
+  }
+]
