@@ -34,6 +34,8 @@ def _norm_cell(v):
 
 
 def _rows_match(gold_rows, got_rows) -> bool:
+    """Order-insensitive row comparison with float tolerance: both sides are
+    sorted the same way, then compared cell by cell."""
     if len(gold_rows) != len(got_rows):
         return False
     if not gold_rows:

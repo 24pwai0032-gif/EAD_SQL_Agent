@@ -251,8 +251,13 @@ def main():
                     [(i + 1, n, PROVINCE_ID[p] if p else None) for i, (n, p) in enumerate(AGENCIES)])
 
     # --- Transactions -----------------------------------------------------
-    # Generate agreement lifecycles (commitment -> disbursements -> debt
-    # service for loans) until we have at least N_ROWS transactions.
+    # Each financing agreement produces a realistic lifecycle of rows:
+    #   1. one Commitment (the signing),
+    #   2. several Disbursement tranches spread over later fiscal years,
+    #   3. for Loans only: yearly Principal Repayment + Interest Payment
+    #      rows after a grace period (grants/TA are never repaid).
+    # We keep generating agreements until we have at least N_ROWS
+    # transactions, then trim to exactly N_ROWS.
     rows = []
     agr_seq = 0
     txn_seq = 0

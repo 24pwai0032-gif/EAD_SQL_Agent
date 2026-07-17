@@ -21,14 +21,19 @@ import config
 from agent.database import SQLGuardError, get_db, run_query
 
 # --- Per-run capture of what the tools actually did/saw -------------------
+#
+# graph.ask() calls start_capture() before each run; the tools below write
+# into the active capture as they execute. After the run, ask() reads the
+# capture to build the response (sql, table, chart) from the exact data the
+# model saw — nothing is ever re-executed.
 
 
 @dataclass
 class RunCapture:
-    sql: str | None = None
-    columns: list = field(default_factory=list)
-    rows: list = field(default_factory=list)
-    chart_spec: dict | None = None
+    sql: str | None = None           # last successfully executed query
+    columns: list = field(default_factory=list)   # its column names
+    rows: list = field(default_factory=list)      # its rows (structured)
+    chart_spec: dict | None = None   # chart the model proposed, if any
 
 
 _capture: contextvars.ContextVar = contextvars.ContextVar("run_capture", default=None)
@@ -69,6 +74,8 @@ def guarded_sql_db_query(query: str) -> str:
     try:
         executed_sql, columns, rows = run_query(query)
     except SQLGuardError as e:
+        # Guard rejections and database errors are returned as tool output,
+        # not raised: the model reads the message, fixes the query, retries.
         return f"Error: query rejected by the safety guard: {e}"
     except Exception as e:
         return f"Error: {e}"
