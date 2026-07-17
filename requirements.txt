@@ -1,0 +1,13 @@
+langchain>=1.0
+langchain-openai
+langchain-community
+langgraph
+sqlglot
+pandas
+matplotlib
+fastapi
+uvicorn
+gradio
+python-dotenv
+pytest
+httpx
