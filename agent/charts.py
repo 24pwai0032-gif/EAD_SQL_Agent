@@ -43,17 +43,21 @@ def validate_spec(spec, columns, rows):
     Returns a cleaned spec dict or None (drop silently — never error the
     user because the model over-eagerly asked for a chart).
     """
+    # Gate 1: the result set itself must be chartable at all.
     if not spec or not should_chart(columns, rows):
         return None
 
+    # Gate 2: only the four supported chart types.
     chart_type = str(spec.get("type", "")).strip().lower()
     if chart_type not in ALLOWED_CHART_TYPES:
         return None
 
+    # Gate 3: the x column must actually exist in the result.
     x = spec.get("x")
     if x not in columns:
         return None
 
+    # Gate 4: every y column must exist AND be numeric in the actual data.
     # grouped_bar compares two measures across categories: y may be a
     # comma-separated pair of columns.
     y_cols = [c.strip() for c in str(spec.get("y", "")).split(",") if c.strip()]
@@ -69,6 +73,7 @@ def validate_spec(spec, columns, rows):
     elif len(y_cols) != 1:
         return None
 
+    # Gate 5: pie-specific rules — few slices, no negative values.
     if chart_type == "pie":
         if len(rows) > MAX_PIE_SLICES:
             return None

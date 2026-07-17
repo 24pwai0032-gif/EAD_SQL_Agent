@@ -23,6 +23,11 @@ from agent.graph import ask
 
 
 def render_chart(chart: dict | None, columns: list, rows: list):
+    """Turn the agent's chart *specification* into a matplotlib figure.
+
+    `chart` is None whenever the agent (or the hard gate in charts.py)
+    decided a chart would not help — in that case the panel stays empty.
+    """
     if not chart or not rows:
         return None
     df = pd.DataFrame(rows, columns=columns)

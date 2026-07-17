@@ -57,6 +57,9 @@ def ask(question: str, thread_id: str = "default") -> dict:
         cap = start_capture()
         trace: list[str] = []
         answer = ""
+        # stream_mode="updates" yields only the NEW messages of each agent
+        # step (model turn or tool execution), so the trace covers exactly
+        # this run even though the thread carries earlier history.
         for update in agent.stream(
             {"messages": [{"role": "user", "content": question}]},
             {"configurable": {"thread_id": thread_id}},
@@ -64,11 +67,14 @@ def ask(question: str, thread_id: str = "default") -> dict:
         ):
             for node_output in update.values():
                 for msg in (node_output or {}).get("messages", []):
+                    # AI message asking for tools -> record each call.
                     if getattr(msg, "tool_calls", None):
                         trace.extend(_describe_tool_call(tc) for tc in msg.tool_calls)
                     msg_type = getattr(msg, "type", "")
+                    # Failed tool executions are worth seeing in the trace.
                     if msg_type == "tool" and str(msg.content).startswith("Error:"):
                         trace.append(f"  -> {str(msg.content)[:200]}")
+                    # An AI message with no tool calls is the final answer.
                     if msg_type == "ai" and not getattr(msg, "tool_calls", None):
                         answer = msg.text() if callable(getattr(msg, "text", None)) else str(msg.content)
 
