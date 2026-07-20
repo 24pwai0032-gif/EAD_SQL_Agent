@@ -7,9 +7,9 @@ responsive — a centred column on desktop, full width on mobile — and dark by
 default with a light/dark toggle in the header.
 
 Under that skin it is a real analytics assistant: each AI turn renders as one
-bubble containing the prose answer, KPI / summary cards, an embedded chart and
-(for small results) an inline table, followed by a collapsed "Details" section
-with the full table, the exact SQL and the agent trace.
+bubble containing the prose answer, an embedded chart and (for small results)
+an inline table, followed by a collapsed "Details" section with the full
+table, the exact SQL and the agent trace.
 
 LOCAL / ON-PREMISE ONLY, AIR-GAPPED. The page pulls NOTHING from the public
 internet: no CDN, no external stylesheets, no web fonts (the theme font is forced
@@ -23,9 +23,7 @@ tunnel out to gradio.live — a security incident, not a convenience.
 
 The agent is consumed through ONE contract, agent.graph.ask(), returning
 {"answer", "sql", "columns", "rows", "chart", "trace"}. `chart` is a spec (or
-None) rendered here; the SQL is never re-executed. KPI/summary cards are derived
-in this module from each result set; the welcome message's all-time totals are the
-only direct (read-only) database reads.
+None) rendered here; the SQL is never re-executed.
 """
 import html
 import sys
@@ -44,7 +42,7 @@ from matplotlib.ticker import FuncFormatter
 import gradio as gr
 import pandas as pd
 
-from agent import database, llm
+from agent import llm
 from agent.graph import ask
 
 # --- Palette (chart-side constants) --------------------------------------
@@ -70,13 +68,6 @@ EXAMPLES = [
     "Debt service trend",
     "Commitments by sector in FY2025",
 ]
-
-# Fixed, read-only KPI queries for the welcome card. status='Cleared' only.
-KPI_SQL = {
-    "commitments": "SELECT SUM(amount_usd_mn) FROM v_commitments WHERE status = 'Cleared'",
-    "disbursements": "SELECT SUM(amount_usd_mn) FROM v_disbursements WHERE status = 'Cleared'",
-    "debt_service": "SELECT SUM(amount_usd_mn) FROM v_debt_service WHERE status = 'Cleared'",
-}
 
 # Chart PNGs and the avatar live here and are served by Gradio (allowed_paths).
 CHART_DIR = Path(tempfile.mkdtemp(prefix="ead_charts_"))
@@ -139,10 +130,6 @@ def _message_text(content) -> str:
 
 
 # --- Formatting helpers --------------------------------------------------
-def _fmt_usd_mn(value) -> str:
-    return "—" if value is None else f"{value:,.1f} M USD"
-
-
 def _axis_label(col: str) -> str:
     """Plain-English axis title: 'amount_usd_mn' -> 'Amount (USD mn)'."""
     raw = str(col)
@@ -163,119 +150,6 @@ def _group_ylabel(y_cols: list) -> str:
     if all("pkr" in c for c in lows):
         return "PKR mn"
     return _axis_label(y_cols[0])
-
-
-def _short(text: str, limit: int = 24) -> str:
-    text = str(text)
-    return (text[:limit - 1] + "…") if len(text) > limit else text
-
-
-def _numeric_columns(columns, rows):
-    out = []
-    for i, c in enumerate(columns):
-        vals = [r[i] for r in rows if r[i] is not None]
-        if vals and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
-            out.append((i, c))
-    return out
-
-
-# --- KPI / summary derivation (in-UI, from each result set) --------------
-def _kpi_value(sql: str):
-    try:
-        _, _, rows = database.run_query(sql)
-        value = rows[0][0] if rows and rows[0] else None
-        return float(value) if value is not None else None
-    except Exception:
-        return None
-
-
-def _growth(columns, rows, measure_idx, cat_idx):
-    cname = str(columns[cat_idx]).lower()
-    if not any(t in cname for t in ("year", "quarter", "fiscal")):
-        return None
-    pairs = [(str(r[cat_idx]), r[measure_idx]) for r in rows if r[measure_idx] is not None]
-    if len(pairs) < 2:
-        return None
-    pairs.sort(key=lambda p: p[0])
-    first, last = pairs[0][1], pairs[-1][1]
-    return None if first == 0 else (last - first) / abs(first) * 100.0
-
-
-def derive_kpis(columns, rows, chart):
-    """Result set -> up to four KPI / summary cards (single value -> one headline;
-    many rows -> Total, Highest, Average, and Growth or a record count)."""
-    if not rows or not columns:
-        return []
-    nums = _numeric_columns(columns, rows)
-    if not nums:
-        return [("Records", f"{len(rows):,}", "rows returned")]
-
-    num_idx = {i for i, _ in nums}
-    measure_idx = nums[0][0]
-    if chart:
-        yname = chart["y"].split(",")[0].strip()
-        if yname in columns:
-            measure_idx = columns.index(yname)
-    mcol = columns[measure_idx]
-    is_usd = "usd" in mcol.lower()
-    vals = [r[measure_idx] for r in rows if r[measure_idx] is not None]
-
-    def fmt(v):
-        if v is None:
-            return "—"
-        if is_usd:
-            return f"{v:,.1f} M USD"
-        return f"{v:,.0f}" if abs(v) >= 1000 else f"{v:,.2f}"
-
-    name = _axis_label(mcol).split(" (")[0]
-    if len(rows) == 1:
-        return [(name, fmt(vals[0]), "result")]
-
-    cat_idx = columns.index(chart["x"]) if (chart and chart["x"] in columns) else \
-        next((i for i in range(len(columns)) if i not in num_idx), 0)
-    peak = max(range(len(rows)),
-               key=lambda k: rows[k][measure_idx] if rows[k][measure_idx] is not None else float("-inf"))
-    cards = [
-        ("Total", fmt(sum(vals)), name.lower()),
-        ("Highest", fmt(rows[peak][measure_idx]), _short(rows[peak][cat_idx])),
-        ("Average", fmt(sum(vals) / len(vals)), "per record"),
-    ]
-    growth = _growth(columns, rows, measure_idx, cat_idx)
-    cards.append(("Growth", f"{growth:+.1f}%", "first to latest") if growth is not None
-                 else ("Records", f"{len(rows):,}", "rows returned"))
-    return cards[:4]
-
-
-def kpi_cards_html(cards) -> str:
-    """Inline-styled cards so they render inside a chat bubble in both themes."""
-    if not cards:
-        return ""
-    items = "".join(
-        "<div style=\"flex:1;min-width:118px;background:#ffffff;border:1px solid #e5e7eb;"
-        "border-radius:10px;padding:12px 14px\">"
-        f"<div style=\"font-size:11px;font-weight:600;letter-spacing:.5px;"
-        f"text-transform:uppercase;color:#6b7280\">{html.escape(str(label))}</div>"
-        f"<div style=\"font-size:20px;font-weight:700;color:#15803d;margin-top:2px;"
-        f"line-height:1.15\">{html.escape(str(value))}</div>"
-        f"<div style=\"font-size:11px;color:#6b7280;margin-top:3px\">{html.escape(str(sub))}</div>"
-        "</div>"
-        for label, value, sub in cards
-    )
-    return f"<div style=\"display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 2px\">{items}</div>"
-
-
-def all_time_kpi_html() -> str:
-    commitments = _kpi_value(KPI_SQL["commitments"])
-    disbursements = _kpi_value(KPI_SQL["disbursements"])
-    debt_service = _kpi_value(KPI_SQL["debt_service"])
-    undisbursed = (commitments - disbursements
-                   if commitments is not None and disbursements is not None else None)
-    return kpi_cards_html([
-        ("Total commitments", _fmt_usd_mn(commitments), "signed, all years"),
-        ("Total disbursements", _fmt_usd_mn(disbursements), "drawn down"),
-        ("Undisbursed balance", _fmt_usd_mn(undisbursed), "signed, not drawn"),
-        ("Total debt service", _fmt_usd_mn(debt_service), "principal + interest"),
-    ])
 
 
 # --- Result table --------------------------------------------------------
@@ -425,12 +299,9 @@ def build_ai_messages(result):
         answer += "\n\n_No records matched this query._"
 
     chart_path = render_chart_png(result["chart"], columns, rows)
-    cards = derive_kpis(columns, rows, result["chart"])
     inline_table = table_markdown(columns, rows, max_rows=12) if rows else None
 
     content = [answer]
-    if cards:
-        content.append(kpi_cards_html(cards))
     if chart_path:
         content.append({"path": chart_path})
     if inline_table:
@@ -451,9 +322,8 @@ def build_ai_messages(result):
 def welcome_messages():
     intro = ("**Thanks for reaching out!** I can help you analyze Foreign Economic "
              "Assistance — commitments, disbursements and debt service. Ask me "
-             "anything, or tap an example below. Here are the all-time totals "
-             "(cleared transactions) to start:")
-    return [{"role": "assistant", "content": [intro, all_time_kpi_html(), _stamp()]}]
+             "anything, or tap an example below to get started.")
+    return [{"role": "assistant", "content": [intro, _stamp()]}]
 
 
 # --- Handlers ------------------------------------------------------------
@@ -533,8 +403,10 @@ CSS = """
 }
 
 gradio-app, body { background: var(--page) !important; }
-.gradio-container { max-width: 720px !important; margin: 0 auto !important;
-    padding: 12px 12px 8px !important; background: var(--page) !important; }
+/* Fluid column: comfortable reading width on desktop, edge-to-edge on phones. */
+.gradio-container { width: 100% !important; max-width: 820px !important;
+    margin: 0 auto !important; background: var(--page) !important;
+    padding: clamp(6px, 2vw, 14px) clamp(6px, 2.5vw, 14px) 8px !important; }
 
 /* Header (gradient) */
 #appheader { background: var(--grad) !important; border-radius: 14px !important;
@@ -559,9 +431,23 @@ gradio-app, body { background: var(--page) !important; }
     line-height: 1 !important; color: #fff !important; background: rgba(255,255,255,.16) !important;
     border: 1px solid rgba(255,255,255,.3) !important; box-shadow: none !important; }
 
-/* Chat surface */
-#chatbox { height: 62vh !important; border: 1px solid var(--block-border-color) !important;
+/* Chat surface. dvh (not vh) so mobile browser toolbars don't hide the composer. */
+#chatbox { height: min(64dvh, 640px) !important;
+    border: 1px solid var(--block-border-color) !important;
     border-radius: 14px !important; margin-top: 10px !important; }
+
+/* Charts and any image inside a bubble scale with the bubble, never overflow. */
+#chatbox .message img, #chatbox img { max-width: 100% !important; height: auto !important;
+    border-radius: 10px; }
+/* Answer + chart share one bubble: give the pieces breathing room. */
+#chatbox .message-content > * + * { margin-top: 8px; }
+/* Wide result tables scroll inside the bubble instead of breaking the layout. */
+#chatbox .message table { display: block; max-width: 100%; overflow-x: auto;
+    white-space: nowrap; font-size: 12.5px; }
+#chatbox .message th, #chatbox .message td { padding: 4px 10px; }
+/* Long refs/SQL wrap instead of stretching bubbles off-screen. */
+#chatbox .message { overflow-wrap: anywhere; }
+#chatbox .message pre { max-width: 100%; overflow-x: auto; }
 
 /* Composer */
 #composer { gap: 10px !important; align-items: center !important; margin-top: 10px !important; }
@@ -583,8 +469,34 @@ gradio-app, body { background: var(--page) !important; }
 #powered { text-align: center; font-size: 11.5px; color: var(--muted); margin: 10px 0 4px; }
 #powered b { color: #22a89a; }
 
-@media (max-width: 720px) { .gradio-container { padding: 8px !important; }
-    #chatbox { height: 58vh !important; } .brand-name { font-size: 17px; } }
+/* --- Responsive breakpoints ------------------------------------------- */
+/* Tablet: slightly tighter chrome, chat gets more of the screen. */
+@media (max-width: 900px) {
+    #chatbox { height: min(62dvh, 600px) !important; }
+}
+/* Phone: full-width column, larger tap targets, chips scroll horizontally. */
+@media (max-width: 640px) {
+    .gradio-container { padding: 6px 6px 4px !important; }
+    #appheader { padding: 10px 12px !important; border-radius: 12px !important; }
+    .brand-name { font-size: 16.5px; }
+    .brand-status { font-size: 11.5px; }
+    #chatbox { height: calc(100dvh - 258px) !important; min-height: 320px;
+        border-radius: 12px !important; }
+    /* 16px stops iOS Safari from auto-zooming the page on focus. */
+    #composer-input textarea, #composer-input input { font-size: 16px !important;
+        padding: 10px 14px !important; }
+    #send-btn { min-width: 44px !important; width: 44px !important; height: 44px !important; }
+    #chips { flex-wrap: nowrap !important; overflow-x: auto !important;
+        scrollbar-width: none; padding-bottom: 2px !important; }
+    #chips::-webkit-scrollbar { display: none; }
+    #chips button { flex: 0 0 auto !important; }
+}
+/* Small phones: compact header, footer trimmed. */
+@media (max-width: 400px) {
+    .brand-name { font-size: 15px; }
+    #theme-toggle { min-width: 40px !important; width: 40px !important; }
+    #powered { font-size: 10.5px; }
+}
 """
 
 
