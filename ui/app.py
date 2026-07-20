@@ -1,216 +1,653 @@
-"""Gradio UI — LOCAL TESTING ONLY.
+"""AI Analytics Chat for the EAD Foreign Economic Assistance agent.
 
-share=False always: on a government network share=True opens a tunnel out to
-gradio.live — that is a security incident, not a convenience.
+A branded, chat-widget-style analytics assistant (the "atombot" look): a dark
+navy conversation with a gradient header, rounded bubbles, a green-dot assistant
+avatar, a circular send button and a "Powered by atomcamp AI" footer. It is fully
+responsive — a centred column on desktop, full width on mobile — and dark by
+default with a light/dark toggle in the header.
 
-Rendering happens HERE, in the client, from the chart *specification* the
-agent returns. The API never ships a rendered image.
+Under that skin it is a real analytics assistant: each AI turn renders as one
+bubble containing the prose answer, KPI / summary cards, an embedded chart and
+(for small results) an inline table, followed by a collapsed "Details" section
+with the full table, the exact SQL and the agent trace.
 
-Layout: a chat panel (with per-session conversation memory) on the left and
-a details panel (chart, result table, SQL, agent steps) on the right, so a
-non-technical reader sees question -> answer, and the SQL stays one click
-away for anyone who wants to check it.
+LOCAL / ON-PREMISE ONLY, AIR-GAPPED. The page pulls NOTHING from the public
+internet: no CDN, no external stylesheets, no web fonts (the theme font is forced
+to a system stack — Gradio's default themes would otherwise fetch Google Fonts),
+no Plotly. Charts are STATIC matplotlib PNGs (Agg backend) embedded in the message
+with Gradio's native expand + download; interactive JS charts are not possible
+here. Gradio telemetry is switched off, and every icon is an inline SVG.
+
+share=False, always: on a government network share=True would open a public
+tunnel out to gradio.live — a security incident, not a convenience.
+
+The agent is consumed through ONE contract, agent.graph.ask(), returning
+{"answer", "sql", "columns", "rows", "chart", "trace"}. `chart` is a spec (or
+None) rendered here; the SQL is never re-executed. KPI/summary cards are derived
+in this module from each result set; the welcome message's all-time totals are the
+only direct (read-only) database reads.
 """
+import html
 import sys
+import tempfile
+import traceback
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import matplotlib
-matplotlib.use("Agg")  # no display server; Plotly would pull JS from a CDN
+matplotlib.use("Agg")  # headless: no display server, and never a JS/CDN renderer
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import gradio as gr
 import pandas as pd
 
-from agent import llm
+from agent import database, llm
 from agent.graph import ask
 
-# Colorblind-safe categorical palette; the slot ORDER is the safety
-# mechanism (adjacent hues stay distinguishable under CVD), so series
-# take slots in this fixed order, never cycled or re-sorted.
-PALETTE = ["#2a78d6", "#008300", "#e87ba4", "#eda100",
-           "#1baf7a", "#eb6834", "#4a3aa7", "#e34948"]
-SURFACE = "#fcfcfb"   # chart surface
-INK = "#0b0b0b"       # titles
-INK_2 = "#52514e"     # axis titles / legend text
-MUTED = "#898781"     # tick labels
-GRID = "#e1e0d9"      # hairline gridlines
-BASELINE = "#c3c2b7"  # x-axis baseline
+# --- Palette (chart-side constants) --------------------------------------
+GREEN = "#15803d"      # primary accent — chart marks (brand green)
+GREEN_2 = "#5c9e7a"    # secondary green — 2nd series of a grouped bar only
+INK = "#1a1a1a"        # chart titles
+INK_2 = "#374151"      # axis titles
+GRAY = "#6b7280"       # tick labels
+GRID = "#eceff2"       # hairline y-gridlines
+BASELINE = "#d1d5db"   # x-axis baseline
 
+# System font stack ONLY. Plain strings -> Gradio uses them verbatim and emits no
+# @font-face / no fonts.googleapis.com request (see gradio themes/base.py).
+SYSTEM_FONT = ["system-ui", "-apple-system", "BlinkMacSystemFont",
+               '"Segoe UI"', "Roboto", '"Helvetica Neue"', "Arial", "sans-serif"]
+SYSTEM_MONO = ["ui-monospace", "SFMono-Regular", "Menlo", '"Cascadia Mono"',
+               "Consolas", '"Liberation Mono"', "monospace"]
+
+# Example prompts (EAD domain) shown as chips under the composer.
 EXAMPLES = [
-    "Show the trend of cleared disbursements over fiscal years in USD",
-    "Who are our top 5 partners by total cleared disbursements?",
-    "What was our total debt service in FY2025?",
-    "Break down cleared commitments in FY2025 by sector",
+    "Disbursements by fiscal year",
+    "Top 5 partners by disbursements",
+    "Debt service trend",
+    "Commitments by sector in FY2025",
 ]
 
-CSS = """
-#header h1 {margin-bottom: 0.1em}
-#header p {margin-top: 0.2em}
-#examples-label {margin-bottom: -8px}
-"""
+# Fixed, read-only KPI queries for the welcome card. status='Cleared' only.
+KPI_SQL = {
+    "commitments": "SELECT SUM(amount_usd_mn) FROM v_commitments WHERE status = 'Cleared'",
+    "disbursements": "SELECT SUM(amount_usd_mn) FROM v_disbursements WHERE status = 'Cleared'",
+    "debt_service": "SELECT SUM(amount_usd_mn) FROM v_debt_service WHERE status = 'Cleared'",
+}
+
+# Chart PNGs and the avatar live here and are served by Gradio (allowed_paths).
+CHART_DIR = Path(tempfile.mkdtemp(prefix="ead_charts_"))
+
+# Shown only when no model is configured at all (has_credentials() is False).
+CONFIG_ERROR_MD = ("**The analysis service is not configured.**\n\nNo model is set "
+                   "up. Please add a valid model configuration to `.env`, then "
+                   "restart the application.")
+# Shown when the agent raised at runtime (config IS present) — the real traceback
+# is printed to the server console, never blamed on missing config.
+RUNTIME_ERROR_MD = ("**Something went wrong while analysing your question.**\n\n"
+                    "Please try asking again in a moment. If it keeps happening, the "
+                    "model service may be busy or unreachable.")
 
 
-def _pretty(label: str) -> str:
-    """fiscal_year -> fiscal year; keeps axis titles readable for humans."""
-    return str(label).replace("_", " ")
+def _make_bot_avatar():
+    """A small green dot avatar for the assistant — generated locally (no external
+    image), matching the reference widget."""
+    fig, ax = plt.subplots(figsize=(0.64, 0.64), dpi=120)
+    ax.add_patch(plt.Circle((0.5, 0.5), 0.44, color="#22c55e"))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    path = CHART_DIR / "bot_avatar.png"
+    fig.savefig(path, transparent=True, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    return str(path)
 
 
-def _style_axes(ax):
-    """Recessive chrome: y-grid hairlines only, baseline-only spines,
-    muted tick labels — the data ink should be the loudest thing."""
-    ax.set_facecolor(SURFACE)
+BOT_AVATAR = _make_bot_avatar()
+
+
+def _stamp() -> str:
+    """A subtle message timestamp, e.g. '4:02 PM'."""
+    t = datetime.now().strftime("%I:%M %p").lstrip("0")
+    return f"<div style='font-size:11px;color:#8b98a5;margin-top:6px'>{t}</div>"
+
+
+def _message_text(content) -> str:
+    """Extract the plain question text from a chat message's content.
+
+    Gradio normalises message content on the client<->server round-trip, so by
+    the time bot() sees it the user's message may be a plain string, a
+    {'text':..., 'type':'text'} dict, or a list of those — not the string we
+    stored. Return the first text fragment either way (never a dict, which the
+    agent would reject as an invalid message).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return content.get("text", "")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                return item
+            if isinstance(item, dict) and item.get("type", "text") == "text" and item.get("text"):
+                return item["text"]
+    return str(content or "")
+
+
+# --- Formatting helpers --------------------------------------------------
+def _fmt_usd_mn(value) -> str:
+    return "—" if value is None else f"{value:,.1f} M USD"
+
+
+def _axis_label(col: str) -> str:
+    """Plain-English axis title: 'amount_usd_mn' -> 'Amount (USD mn)'."""
+    raw = str(col)
+    words = [w for w in raw.replace("_", " ").split() if w.lower() not in {"usd", "pkr", "mn"}]
+    label = " ".join(w[:1].upper() + w[1:] for w in words) if words else raw
+    low = raw.lower()
+    if "usd" in low:
+        label += " (USD mn)"
+    elif "pkr" in low:
+        label += " (PKR mn)"
+    return label
+
+
+def _group_ylabel(y_cols: list) -> str:
+    lows = [c.lower() for c in y_cols]
+    if all("usd" in c for c in lows):
+        return "USD mn"
+    if all("pkr" in c for c in lows):
+        return "PKR mn"
+    return _axis_label(y_cols[0])
+
+
+def _short(text: str, limit: int = 24) -> str:
+    text = str(text)
+    return (text[:limit - 1] + "…") if len(text) > limit else text
+
+
+def _numeric_columns(columns, rows):
+    out = []
+    for i, c in enumerate(columns):
+        vals = [r[i] for r in rows if r[i] is not None]
+        if vals and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
+            out.append((i, c))
+    return out
+
+
+# --- KPI / summary derivation (in-UI, from each result set) --------------
+def _kpi_value(sql: str):
+    try:
+        _, _, rows = database.run_query(sql)
+        value = rows[0][0] if rows and rows[0] else None
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _growth(columns, rows, measure_idx, cat_idx):
+    cname = str(columns[cat_idx]).lower()
+    if not any(t in cname for t in ("year", "quarter", "fiscal")):
+        return None
+    pairs = [(str(r[cat_idx]), r[measure_idx]) for r in rows if r[measure_idx] is not None]
+    if len(pairs) < 2:
+        return None
+    pairs.sort(key=lambda p: p[0])
+    first, last = pairs[0][1], pairs[-1][1]
+    return None if first == 0 else (last - first) / abs(first) * 100.0
+
+
+def derive_kpis(columns, rows, chart):
+    """Result set -> up to four KPI / summary cards (single value -> one headline;
+    many rows -> Total, Highest, Average, and Growth or a record count)."""
+    if not rows or not columns:
+        return []
+    nums = _numeric_columns(columns, rows)
+    if not nums:
+        return [("Records", f"{len(rows):,}", "rows returned")]
+
+    num_idx = {i for i, _ in nums}
+    measure_idx = nums[0][0]
+    if chart:
+        yname = chart["y"].split(",")[0].strip()
+        if yname in columns:
+            measure_idx = columns.index(yname)
+    mcol = columns[measure_idx]
+    is_usd = "usd" in mcol.lower()
+    vals = [r[measure_idx] for r in rows if r[measure_idx] is not None]
+
+    def fmt(v):
+        if v is None:
+            return "—"
+        if is_usd:
+            return f"{v:,.1f} M USD"
+        return f"{v:,.0f}" if abs(v) >= 1000 else f"{v:,.2f}"
+
+    name = _axis_label(mcol).split(" (")[0]
+    if len(rows) == 1:
+        return [(name, fmt(vals[0]), "result")]
+
+    cat_idx = columns.index(chart["x"]) if (chart and chart["x"] in columns) else \
+        next((i for i in range(len(columns)) if i not in num_idx), 0)
+    peak = max(range(len(rows)),
+               key=lambda k: rows[k][measure_idx] if rows[k][measure_idx] is not None else float("-inf"))
+    cards = [
+        ("Total", fmt(sum(vals)), name.lower()),
+        ("Highest", fmt(rows[peak][measure_idx]), _short(rows[peak][cat_idx])),
+        ("Average", fmt(sum(vals) / len(vals)), "per record"),
+    ]
+    growth = _growth(columns, rows, measure_idx, cat_idx)
+    cards.append(("Growth", f"{growth:+.1f}%", "first to latest") if growth is not None
+                 else ("Records", f"{len(rows):,}", "rows returned"))
+    return cards[:4]
+
+
+def kpi_cards_html(cards) -> str:
+    """Inline-styled cards so they render inside a chat bubble in both themes."""
+    if not cards:
+        return ""
+    items = "".join(
+        "<div style=\"flex:1;min-width:118px;background:#ffffff;border:1px solid #e5e7eb;"
+        "border-radius:10px;padding:12px 14px\">"
+        f"<div style=\"font-size:11px;font-weight:600;letter-spacing:.5px;"
+        f"text-transform:uppercase;color:#6b7280\">{html.escape(str(label))}</div>"
+        f"<div style=\"font-size:20px;font-weight:700;color:#15803d;margin-top:2px;"
+        f"line-height:1.15\">{html.escape(str(value))}</div>"
+        f"<div style=\"font-size:11px;color:#6b7280;margin-top:3px\">{html.escape(str(sub))}</div>"
+        "</div>"
+        for label, value, sub in cards
+    )
+    return f"<div style=\"display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 2px\">{items}</div>"
+
+
+def all_time_kpi_html() -> str:
+    commitments = _kpi_value(KPI_SQL["commitments"])
+    disbursements = _kpi_value(KPI_SQL["disbursements"])
+    debt_service = _kpi_value(KPI_SQL["debt_service"])
+    undisbursed = (commitments - disbursements
+                   if commitments is not None and disbursements is not None else None)
+    return kpi_cards_html([
+        ("Total commitments", _fmt_usd_mn(commitments), "signed, all years"),
+        ("Total disbursements", _fmt_usd_mn(disbursements), "drawn down"),
+        ("Undisbursed balance", _fmt_usd_mn(undisbursed), "signed, not drawn"),
+        ("Total debt service", _fmt_usd_mn(debt_service), "principal + interest"),
+    ])
+
+
+# --- Result table --------------------------------------------------------
+def format_table(columns, rows):
+    df = pd.DataFrame(rows, columns=columns)
+    for col in df.columns:
+        if pd.api.types.is_float_dtype(df[col]):
+            df[col] = df[col].map(lambda v: f"{v:,.2f}" if pd.notna(v) else "")
+        elif pd.api.types.is_integer_dtype(df[col]):
+            df[col] = df[col].map(lambda v: f"{v:,}" if pd.notna(v) else "")
+    return df
+
+
+def table_markdown(columns, rows, max_rows=12):
+    if not rows or not columns:
+        return None
+    df = format_table(columns, rows).head(max_rows)
+    head = "| " + " | ".join(str(c) for c in df.columns) + " |"
+    sep = "| " + " | ".join("---" for _ in df.columns) + " |"
+    body = "\n".join("| " + " | ".join(str(v) for v in row) + " |"
+                     for row in df.itertuples(index=False))
+    md = "\n".join([head, sep, body])
+    if len(rows) > max_rows:
+        md += f"\n\n_Showing {max_rows} of {len(rows):,} rows — full table in Details._"
+    return md
+
+
+def details_markdown(sql, trace, columns, rows, table_shown_inline):
+    parts = []
+    if rows and not table_shown_inline:
+        parts.append("**Result table**\n\n" + table_markdown(columns, rows, max_rows=200))
+    parts.append("**SQL executed**\n\n```sql\n" + (sql or "-- no query executed") + "\n```")
+    if trace:
+        parts.append("**Agent steps**\n\n```text\n" + "\n".join(trace) + "\n```")
+    return "\n\n".join(parts)
+
+
+# --- Chart rendering (static PNG) ----------------------------------------
+def _style_axes(ax, vmax: float):
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(BASELINE)
-    ax.yaxis.grid(True, color=GRID, linewidth=0.8)
+    ax.yaxis.grid(True, color=GRID, linewidth=1)
     ax.set_axisbelow(True)
-    ax.tick_params(colors=MUTED, labelcolor=INK_2, length=0)
+    ax.tick_params(colors=GRAY, length=0, labelsize=9)
+    decimals = 1 if 0 < vmax < 10 else 0
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.{decimals}f}"))
 
 
-def render_chart(chart: dict | None, columns: list, rows: list):
-    """Turn the agent's chart *specification* into a matplotlib figure.
+def _value_labels(ax, bars, values):
+    numeric = [v for v in values if v is not None]
+    if len(bars) > 12 or not numeric:
+        return
+    decimals = 0 if max(abs(v) for v in numeric) >= 100 else 1
+    labels = [f"{v:,.{decimals}f}" if v is not None else "" for v in values]
+    ax.bar_label(bars, labels=labels, padding=3, color=INK_2, fontsize=8.5)
 
-    `chart` is None whenever the agent (or the hard gate in charts.py)
-    decided a chart would not help — in that case the panel stays empty.
-    """
+
+def _build_figure(chart, columns, rows):
     if not chart or not rows:
         return None
     df = pd.DataFrame(rows, columns=columns)
-    x, title = chart["x"], chart["title"]
-    fig, ax = plt.subplots(figsize=(7.5, 4.2))
-    fig.patch.set_facecolor(SURFACE)
-    if chart["type"] == "bar":
-        ax.bar(df[x].astype(str), df[chart["y"]], color=PALETTE[0], width=0.72, zorder=3)
-        ax.set_ylabel(_pretty(chart["y"]), color=INK_2)
-        _style_axes(ax)
-    elif chart["type"] == "line":
-        ax.plot(df[x].astype(str), df[chart["y"]],
-                color=PALETTE[0], linewidth=2, marker="o", markersize=5, zorder=3)
-        ax.set_ylabel(_pretty(chart["y"]), color=INK_2)
-        _style_axes(ax)
-    elif chart["type"] == "pie":
-        _, _, autotexts = ax.pie(
-            df[chart["y"]], labels=[_pretty(v) for v in df[x].astype(str)],
-            autopct="%1.1f%%", colors=PALETTE[:len(df)], startangle=90,
-            counterclock=False, wedgeprops={"edgecolor": SURFACE, "linewidth": 2},
-            textprops={"color": INK_2})
-        # percentage labels sit ON the coloured slices — plain gray vanishes
-        # against the darker hues; bold white stays readable on all of them
-        plt.setp(autotexts, color="white", fontweight="bold")
-    elif chart["type"] == "grouped_bar":
-        y_cols = [c.strip() for c in chart["y"].split(",")]
-        n = len(df)
-        width = 0.8 / len(y_cols)
-        for i, y in enumerate(y_cols):
-            ax.bar([j + i * width for j in range(n)], df[y], width=width * 0.94,
-                   label=_pretty(y), color=PALETTE[i % len(PALETTE)], zorder=3)
-        ax.set_xticks([j + 0.4 - width / 2 for j in range(n)])
+    ctype, x, title = chart["type"], chart["x"], chart["title"]
+    fig, ax = plt.subplots(figsize=(6.8, 4.0))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    if ctype == "bar":
+        values = df[chart["y"]]
+        bars = ax.bar(df[x].astype(str), values, color=GREEN, width=0.68, zorder=3)
+        ax.set_ylabel(_axis_label(chart["y"]), color=INK_2, fontsize=10)
+        _style_axes(ax, max((abs(v) for v in values if v is not None), default=0))
+        _value_labels(ax, bars, list(values))
+
+    elif ctype == "line":
+        values = df[chart["y"]]
+        xs = list(range(len(df)))
+        ax.fill_between(xs, list(values), color=GREEN, alpha=0.10, zorder=2)
+        ax.plot(xs, values, color=GREEN, linewidth=2.2, marker="o", markersize=6,
+                markerfacecolor=GREEN, markeredgecolor="white", zorder=3)
+        ax.set_xticks(xs)
         ax.set_xticklabels(df[x].astype(str))
-        # >= 2 series: a legend is required — identity must not be color-alone.
-        ax.legend(frameon=False, labelcolor=INK_2)
-        _style_axes(ax)
-    ax.set_title(title, loc="left", color=INK, fontweight="bold", pad=12)
-    if chart["type"] != "pie":
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+        ax.set_ylabel(_axis_label(chart["y"]), color=INK_2, fontsize=10)
+        _style_axes(ax, max((abs(v) for v in values if v is not None), default=0))
+
+    elif ctype == "pie":
+        values = df[chart["y"]]
+        n = len(df)
+        cmap = plt.get_cmap("Greens")
+        colors = [cmap(0.45 + 0.4 * (i / max(n - 1, 1))) for i in range(n)]
+        _, _, autotexts = ax.pie(
+            values, labels=[str(v) for v in df[x]], autopct="%1.1f%%",
+            colors=colors, startangle=90, counterclock=False,
+            wedgeprops={"edgecolor": "white", "linewidth": 2},
+            textprops={"color": INK, "fontsize": 9})
+        plt.setp(autotexts, color="white", fontweight="bold")
+        ax.set_title(title, loc="center", color=INK, fontweight="bold", pad=14, fontsize=12)
+        fig.tight_layout()
+        return fig
+
+    elif ctype == "grouped_bar":
+        y_cols = [c.strip() for c in chart["y"].split(",")]
+        n, k = len(df), len(y_cols)
+        width = 0.8 / k
+        vmax = 0.0
+        containers = []
+        for i, y in enumerate(y_cols):
+            positions = [j + i * width for j in range(n)]
+            bars = ax.bar(positions, df[y], width=width * 0.9, label=_axis_label(y),
+                          color=GREEN if i == 0 else GREEN_2, zorder=3)
+            containers.append((bars, list(df[y])))
+            vmax = max(vmax, max((abs(v) for v in df[y] if v is not None), default=0))
+        ax.set_xticks([j + width * (k - 1) / 2 for j in range(n)])
+        ax.set_xticklabels(df[x].astype(str))
+        ax.set_ylabel(_group_ylabel(y_cols), color=INK_2, fontsize=10)
+        ax.legend(frameon=False, fontsize=9, labelcolor=INK_2)
+        _style_axes(ax, vmax)
+        if n * k <= 12:
+            for bars, values in containers:
+                _value_labels(ax, bars, values)
+
+    ax.set_title(title, loc="left", color=INK, fontweight="bold", pad=12, fontsize=12)
+    if len(df) > 6:
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     fig.tight_layout()
     return fig
 
 
-def respond(question, history, thread_id):
-    """One chat turn: append the user question, run the agent, append the
-    answer, and refresh the details panel (chart / table / SQL / steps)."""
-    history = list(history or [])
+def render_chart_png(chart, columns, rows):
+    try:
+        fig = _build_figure(chart, columns, rows)
+    except Exception:
+        return None
+    if fig is None:
+        return None
+    path = CHART_DIR / f"chart_{uuid.uuid4().hex}.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return str(path)
+
+
+# --- Turning a result into chat messages ---------------------------------
+def build_ai_messages(result):
+    columns, rows = result["columns"], result["rows"]
+    answer = result["answer"] or "_No answer was returned for this question._"
+    if not rows:
+        answer += "\n\n_No records matched this query._"
+
+    chart_path = render_chart_png(result["chart"], columns, rows)
+    cards = derive_kpis(columns, rows, result["chart"])
+    inline_table = table_markdown(columns, rows, max_rows=12) if rows else None
+
+    content = [answer]
+    if cards:
+        content.append(kpi_cards_html(cards))
+    if chart_path:
+        content.append({"path": chart_path})
+    if inline_table:
+        content.append("**Result**\n\n" + inline_table)
+    content.append(_stamp())
+
+    messages = [{"role": "assistant", "content": content}]
+    details = details_markdown(result["sql"], result["trace"], columns, rows,
+                               table_shown_inline=inline_table is not None)
+    messages.append({
+        "role": "assistant",
+        "content": details,
+        "metadata": {"title": "Details — SQL & agent steps", "status": "done"},
+    })
+    return messages
+
+
+def welcome_messages():
+    intro = ("**Thanks for reaching out!** I can help you analyze Foreign Economic "
+             "Assistance — commitments, disbursements and debt service. Ask me "
+             "anything, or tap an example below. Here are the all-time totals "
+             "(cleared transactions) to start:")
+    return [{"role": "assistant", "content": [intro, all_time_kpi_html(), _stamp()]}]
+
+
+# --- Handlers ------------------------------------------------------------
+def add_user(question, chat):
+    """Append the user's message and clear the box. No-op on empty input.
+    Outputs: [question, chatbot, send_btn]."""
     q = (question or "").strip()
     if not q:
-        # Nothing typed: leave every panel exactly as it is.
-        return "", history, gr.update(), gr.update(), gr.update(), gr.update(), thread_id
-
-    history.append({"role": "user", "content": q})
-    try:
-        result = ask(q, thread_id=thread_id)
-    except Exception as exc:  # never crash the chat; surface the error inline
-        history.append({"role": "assistant",
-                        "content": f"⚠️ Sorry, something went wrong: {exc}"})
-        return "", history, gr.update(), gr.update(), gr.update(), gr.update(), thread_id
-
-    fig = render_chart(result["chart"], result["columns"], result["rows"])
-    table = (pd.DataFrame(result["rows"], columns=result["columns"])
-             if result["rows"] else None)
-    sql = result["sql"] or "-- no query executed"
-    trace = ("```\n" + "\n".join(result["trace"]) + "\n```"
-             if result["trace"] else "_no steps recorded_")
-
-    answer = result["answer"] or "_(no answer returned)_"
-    extras = (["chart"] if fig is not None else []) + (["result table"] if table is not None else [])
-    if extras:
-        answer += f"\n\n<sub>📊 See the {' and '.join(extras)} in the details panel.</sub>"
-    history.append({"role": "assistant", "content": answer})
-
-    return "", history, sql, table, fig, trace, thread_id
+        return gr.update(), chat, gr.update()
+    user_msg = {"role": "user", "content": q}
+    return "", (chat or []) + [user_msg], gr.update(interactive=False)
 
 
-def reset():
-    """New conversation: fresh thread_id (fresh agent memory), empty panels."""
-    return "", [], "-- no query executed", None, None, "", str(uuid.uuid4())
+def bot(chat, thread_id):
+    """Run the agent for the latest user message, streaming a loading state
+    first. Generator. Outputs: [chatbot, send_btn]."""
+    if not chat or chat[-1]["role"] != "user":
+        yield chat, gr.update(interactive=True)
+        return
+    question = _message_text(chat[-1]["content"])
+    yield chat + [{"role": "assistant", "content": "_Analysing your question…_"}], \
+        gr.update(interactive=False)
+
+    if not llm.has_credentials():
+        messages = [{"role": "assistant", "content": CONFIG_ERROR_MD}]
+    else:
+        try:
+            messages = build_ai_messages(ask(question, thread_id=thread_id))
+        except Exception:
+            # Surface the real cause to the server console (never to the user,
+            # and never mislabelled as a config problem).
+            print("[error] agent turn failed:", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
+            messages = [{"role": "assistant", "content": RUNTIME_ERROR_MD}]
+    yield chat + messages, gr.update(interactive=True)
 
 
-with gr.Blocks(title="EAD SQL Agent (local testing)") as demo:
+def new_chat():
+    """Fresh conversation: new thread (fresh agent memory).
+    Outputs: [chatbot, thread, send_btn]."""
+    return welcome_messages(), str(uuid.uuid4()), gr.update(interactive=True)
+
+
+# --- Theme + CSS ---------------------------------------------------------
+THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.emerald,
+    neutral_hue=gr.themes.colors.slate,
+    font=SYSTEM_FONT,        # system stack -> no Google Fonts request
+    font_mono=SYSTEM_MONO,
+)
+
+# Dark is the default look. Gradio scopes its dark vars to ':root.dark', so adding
+# 'dark' to <html> switches Gradio's components AND our chrome together.
+FORCE_DARK_JS = "() => { document.documentElement.classList.add('dark'); }"
+THEME_TOGGLE_JS = "() => { document.documentElement.classList.toggle('dark'); }"
+
+# A paper-plane, inline (air-gapped): no external icon fetch.
+_PLANE = ("url(\"data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'"
+          "%20viewBox='0%200%2024%2024'%20fill='white'%3E%3Cpath%20d='M2%2021l21-9L2"
+          "%203v7l15%202-15%202z'/%3E%3C/svg%3E\")")
+
+CSS = """
+:root { --grad: linear-gradient(100deg,#219a57 0%,#22a89a 52%,#caa54b 100%);
+        --page:#f5f6f7; --text:#1a1a1a; --muted:#6b7280;
+        --bot:#eef4f1; --user:#15803d; }
+:root.dark {
+  /* our chrome */
+  --page:#0a1826; --text:#e6edf3; --muted:#8b98a5; --bot:#13293d; --user:#166534;
+  /* override Gradio's dark greys with navy (our CSS is injected after the theme) */
+  --body-background-fill:#0a1826; --background-fill-primary:#0d2033;
+  --background-fill-secondary:#0d2033; --block-background-fill:#0d2033;
+  --block-border-color:#183350; --border-color-primary:#183350;
+  --input-background-fill:#0c1d2e; --input-border-color:#1c3a56;
+  --body-text-color:#e6edf3; --body-text-color-subdued:#8b98a5;
+  --button-secondary-background-fill:#12283d; --button-secondary-text-color:#e6edf3;
+}
+
+gradio-app, body { background: var(--page) !important; }
+.gradio-container { max-width: 720px !important; margin: 0 auto !important;
+    padding: 12px 12px 8px !important; background: var(--page) !important; }
+
+/* Header (gradient) */
+#appheader { background: var(--grad) !important; border-radius: 14px !important;
+    padding: 13px 18px !important; align-items: center !important;
+    justify-content: space-between !important; flex-wrap: nowrap !important; gap: 10px; }
+.brand-name { font-size: 19px; font-weight: 800; color: #ffffff; line-height: 1.1; }
+.brand-status { font-size: 12.5px; color: rgba(255,255,255,.92); display: flex;
+    align-items: center; gap: 6px; margin-top: 3px; }
+.online-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80;
+    box-shadow: 0 0 0 3px rgba(74,222,128,.25); }
+#header-actions { flex: 0 0 auto !important; gap: 10px !important; align-items: center !important;
+    flex-wrap: nowrap !important; min-width: 0 !important; }
+#theme-toggle { min-width: 46px !important; width: 46px !important; height: 26px !important;
+    padding: 0 !important; border-radius: 999px !important; position: relative;
+    background: rgba(0,0,0,.22) !important; border: 1px solid rgba(255,255,255,.4) !important;
+    color: transparent !important; font-size: 0 !important; box-shadow: none !important; }
+#theme-toggle::before { content: ''; position: absolute; top: 2px; left: 2px; width: 20px;
+    height: 20px; border-radius: 50%; background: #fff; transition: left .2s ease; }
+:root:not(.dark) #theme-toggle::before { left: 22px; }
+#newchat-btn { min-width: 34px !important; width: 34px !important; height: 34px !important;
+    padding: 0 !important; border-radius: 50% !important; font-size: 18px !important;
+    line-height: 1 !important; color: #fff !important; background: rgba(255,255,255,.16) !important;
+    border: 1px solid rgba(255,255,255,.3) !important; box-shadow: none !important; }
+
+/* Chat surface */
+#chatbox { height: 62vh !important; border: 1px solid var(--block-border-color) !important;
+    border-radius: 14px !important; margin-top: 10px !important; }
+
+/* Composer */
+#composer { gap: 10px !important; align-items: center !important; margin-top: 10px !important; }
+#composer-input textarea, #composer-input input { border-radius: 22px !important;
+    padding: 12px 18px !important; }
+#send-btn { min-width: 46px !important; width: 46px !important; height: 46px !important;
+    padding: 0 !important; border-radius: 50% !important; border: none !important;
+    background-color: #22c55e !important; background-image: """ + _PLANE + """ !important;
+    background-repeat: no-repeat !important; background-position: center !important;
+    background-size: 20px !important; color: transparent !important; font-size: 0 !important; }
+#send-btn:hover { background-color: #16a34a !important; }
+
+/* Example chips */
+#chips { gap: 6px !important; margin-top: 8px !important; flex-wrap: wrap !important; }
+#chips button { font-size: 12px !important; font-weight: 500 !important;
+    border-radius: 999px !important; }
+
+/* Footer */
+#powered { text-align: center; font-size: 11.5px; color: var(--muted); margin: 10px 0 4px; }
+#powered b { color: #22a89a; }
+
+@media (max-width: 720px) { .gradio-container { padding: 8px !important; }
+    #chatbox { height: 58vh !important; } .brand-name { font-size: 17px; } }
+"""
+
+
+def status_online() -> str:
+    ready = llm.has_credentials()
+    label = "Online" if ready else "Model not configured"
+    color = "#4ade80" if ready else "#f87171"
+    return ("<div class='brand'><div class='brand-name'>atombot</div>"
+            f"<div class='brand-status'><span class='online-dot' style='background:{color}'></span>"
+            f"{html.escape(label)}</div></div>")
+
+
+# --- Page ----------------------------------------------------------------
+# analytics_enabled=False: no outbound Gradio telemetry from an air-gapped host.
+with gr.Blocks(title="atombot — EAD Analytics", analytics_enabled=False) as demo:
     thread = gr.State(lambda: str(uuid.uuid4()))
 
-    with gr.Column(elem_id="header"):
-        gr.Markdown(
-            "# EAD Assistant — Foreign Economic Assistance\n"
-            "Ask in plain English about **commitments, disbursements and debt service**. "
-            "The agent writes read-only SQL, answers in words, and adds a chart only "
-            "when it genuinely helps.\n\n"
-            f"<sub>Local testing UI · model: `{llm.model_name()}` · database access: read-only</sub>"
-        )
+    with gr.Row(elem_id="appheader"):
+        gr.HTML(status_online())
+        with gr.Row(elem_id="header-actions"):
+            theme_btn = gr.Button("theme", elem_id="theme-toggle")
+            newchat_btn = gr.Button("+", elem_id="newchat-btn")
 
-    with gr.Row(equal_height=False):
-        # --- Left: the conversation ---
-        with gr.Column(scale=6):
-            chatbot = gr.Chatbot(
-                height=480, label="Conversation",
-                placeholder=("**Ask anything about Foreign Economic Assistance.**\n\n"
-                             "Follow-ups work too — e.g. ask about FY2025, then just "
-                             "say *“and what about FY2023?”*"),
-            )
-            with gr.Row():
-                question = gr.Textbox(
-                    placeholder="e.g. What was our total debt service in FY2025?",
-                    show_label=False, scale=8, autofocus=True, container=False,
-                )
-                ask_btn = gr.Button("Ask", variant="primary", scale=1, min_width=80)
-            gr.Markdown("<sub>Try one of these:</sub>", elem_id="examples-label")
-            example_btns = []
-            for row_examples in (EXAMPLES[:2], EXAMPLES[2:]):
-                with gr.Row():
-                    for q in row_examples:
-                        example_btns.append((gr.Button(q, size="sm"), q))
-            new_btn = gr.Button("🗑️ New conversation", size="sm", variant="secondary")
+    chatbot = gr.Chatbot(
+        value=welcome_messages(), elem_id="chatbox", show_label=False,
+        autoscroll=True, sanitize_html=False, render_markdown=True, allow_tags=True,
+        group_consecutive_messages=False, avatar_images=(None, BOT_AVATAR),
+        placeholder="Ask me anything…",
+    )
+    with gr.Row(elem_id="composer"):
+        question = gr.Textbox(
+            placeholder="Ask me anything…", show_label=False, container=False,
+            scale=8, autofocus=True, max_lines=4, elem_id="composer-input")
+        send_btn = gr.Button("Send", scale=1, min_width=46, elem_id="send-btn")
+    with gr.Row(elem_id="chips"):
+        example_btns = [gr.Button(ex, size="sm") for ex in EXAMPLES]
+    gr.HTML("<div id='powered'>Powered by <b>atomcamp AI</b></div>")
 
-        # --- Right: the evidence behind the answer ---
-        with gr.Column(scale=5):
-            chart = gr.Plot(label="Chart — shown only when it helps")
-            with gr.Accordion("Result table", open=True):
-                table = gr.Dataframe(interactive=False)
-            with gr.Accordion("SQL the agent ran", open=False):
-                sql_box = gr.Code(language="sql")
-            with gr.Accordion("How the agent got there", open=False):
-                trace_md = gr.Markdown()
-
-    inputs = [question, chatbot, thread]
-    outputs = [question, chatbot, sql_box, table, chart, trace_md, thread]
-    ask_btn.click(respond, inputs, outputs)
-    question.submit(respond, inputs, outputs)
-    for btn, q in example_btns:
-        btn.click(lambda q=q: q, None, question).then(respond, inputs, outputs)
-    new_btn.click(reset, None, outputs)
+    # Wiring: add the user's message, then run the agent (with a loading state).
+    turn_in = [question, chatbot]
+    turn_out = [question, chatbot, send_btn]
+    question.submit(add_user, turn_in, turn_out).then(bot, [chatbot, thread], [chatbot, send_btn])
+    send_btn.click(add_user, turn_in, turn_out).then(bot, [chatbot, thread], [chatbot, send_btn])
+    for btn in example_btns:
+        (btn.click(lambda ex=btn.value: ex, None, question)
+            .then(add_user, turn_in, turn_out)
+            .then(bot, [chatbot, thread], [chatbot, send_btn]))
+    newchat_btn.click(new_chat, None, [chatbot, thread, send_btn])
+    theme_btn.click(None, None, None, js=THEME_TOGGLE_JS)
+    demo.load(None, None, None, js=FORCE_DARK_JS)  # dark by default
 
 
 if __name__ == "__main__":
-    llm.verify_tool_calling()  # fail loudly before serving anything
+    if llm.has_credentials():
+        try:
+            llm.verify_tool_calling()
+        except Exception as exc:
+            print(f"[warning] Model tool-calling check failed: {exc}")
+    else:
+        print("[warning] No model configured — the chat will open, but questions "
+              "cannot be answered until .env is set up.")
+    # server_name/share are the security-critical binding and stay exactly as
+    # required. theme/css/allowed_paths ride here (Gradio 6 applies theme/css at
+    # launch; allowed_paths serves the embedded chart PNGs and the avatar).
     demo.launch(server_name="127.0.0.1", share=False,
-                theme=gr.themes.Soft(primary_hue="emerald"), css=CSS)
+                theme=THEME, css=CSS, allowed_paths=[str(CHART_DIR)])
