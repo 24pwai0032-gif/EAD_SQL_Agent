@@ -15,6 +15,8 @@ https://docs.langchain.com/oss/python/langchain/sql-agent
 
 ## Quickstart
 
+Requires Python 3.11 or newer.
+
 ```bash
 pip install -r requirements.txt
 cp .env.example .env            # add your OPENAI_API_KEY for development
